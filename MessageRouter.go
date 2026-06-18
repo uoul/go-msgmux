@@ -9,6 +9,10 @@ import (
 	"github.com/google/uuid"
 )
 
+const (
+	DefaultParallelization = 8
+)
+
 // --------------------------------------------------------------------------------------------------
 // Types
 // --------------------------------------------------------------------------------------------------
@@ -26,7 +30,10 @@ type MessageRouter struct {
 	cancel context.CancelFunc
 	iface  IJsonReadWriter
 
-	sem chan struct{}
+	sem             chan struct{}
+	wg              sync.WaitGroup
+	writeMux        sync.Mutex
+	parallelization int
 
 	pendingMux sync.RWMutex
 	pending    map[MessageId]chan Response[json.RawMessage]
@@ -37,8 +44,9 @@ type MessageRouter struct {
 	listenerMux sync.RWMutex
 	listener    map[MessageType]func(ctx context.Context, msg Message[json.RawMessage]) error
 
-	onUnknownMsgType func(ctx context.Context, msg Message[json.RawMessage])
-	onListenerError  func(ctx context.Context, msg Message[json.RawMessage], err error)
+	onUnknownMsgType     func(ctx context.Context, msg Message[json.RawMessage])
+	onListenerError      func(ctx context.Context, msg Message[json.RawMessage], err error)
+	onResponseWriteError func(ctx context.Context, err error)
 }
 
 // --------------------------------------------------------------------------------------------------
@@ -56,7 +64,7 @@ func SendRequest[I any, O any](ctx context.Context, w *MessageRouter, req Reques
 	w.pendingMux.Lock()
 	if err := w.ctx.Err(); err != nil {
 		w.pendingMux.Unlock()
-		return Response[O]{}, fmt.Errorf("device api closed: %w", err)
+		return Response[O]{}, fmt.Errorf("already closed: %w", err)
 	}
 	// Register pending request
 	w.pending[MessageId(req.MsgId)] = respCh
@@ -68,7 +76,7 @@ func SendRequest[I any, O any](ctx context.Context, w *MessageRouter, req Reques
 		w.pendingMux.Unlock()
 	}()
 	// Send Request
-	if err := w.iface.WriteJSON(req); err != nil {
+	if err := w.writeMessage(req); err != nil {
 		return Response[O]{}, fmt.Errorf("write request: %w", err)
 	}
 	// Wait for response or deadline exeeded
@@ -94,7 +102,7 @@ func SendRequest[I any, O any](ctx context.Context, w *MessageRouter, req Reques
 		return Response[O]{}, ctx.Err()
 
 	case <-w.ctx.Done():
-		return Response[O]{}, fmt.Errorf("device api closed: %w", w.ctx.Err())
+		return Response[O]{}, fmt.Errorf("already closed: %w", w.ctx.Err())
 	}
 }
 
@@ -103,20 +111,45 @@ func SendMessage[I any](ctx context.Context, w *MessageRouter, msg Message[I]) e
 	if len(msg.MsgId) <= 0 {
 		msg.MsgId = MessageId(uuid.NewString())
 	}
-	// Send Message
-	if err := w.iface.WriteJSON(msg); err != nil {
-		return fmt.Errorf("write message: %w", err)
-	}
-	return nil
+	return w.writeMessage(msg)
 }
 
 func (mr *MessageRouter) Context() context.Context {
 	return mr.ctx
 }
 
+func (mr *MessageRouter) Close() error {
+	mr.cancel()
+	mr.wg.Wait()
+	return nil
+}
+
 // --------------------------------------------------------------------------------------------------
 // Private
 // --------------------------------------------------------------------------------------------------
+
+func (w *MessageRouter) writeMessage(resp any) error {
+	w.writeMux.Lock()
+	defer w.writeMux.Unlock()
+	if err := w.ctx.Err(); err != nil {
+		return fmt.Errorf("already closed: %w", err)
+	}
+	return w.iface.WriteJSON(resp)
+}
+
+func (w *MessageRouter) dispatch(fn func()) {
+	// Limit number of spawned go routines
+	select {
+	case w.sem <- struct{}{}:
+	case <-w.ctx.Done():
+		return
+	}
+	// Execute handler non blocking
+	w.wg.Go(func() {
+		defer func() { <-w.sem }()
+		fn()
+	})
+}
 
 func (w *MessageRouter) readLoop() {
 	defer func() {
@@ -163,17 +196,7 @@ func (w *MessageRouter) readLoop() {
 			}
 		// Request from Device
 		case hasResponder:
-			// Aquire slot of sem to limit rate
-			select {
-			case w.sem <- struct{}{}:
-			case <-w.ctx.Done():
-				return
-			}
-			// Handle Request asynchronously
-			go func() {
-				// Dispose aquired slot
-				defer func() { <-w.sem }()
-				// Execute handler
+			w.dispatch(func() {
 				result, err := responder(w.ctx, msg)
 				resp := Response[any]{
 					MsgId: msg.MsgId,
@@ -185,39 +208,23 @@ func (w *MessageRouter) readLoop() {
 				} else {
 					resp.Body = result
 				}
-				// Best-effort response write; ignore error.
-				_ = w.iface.WriteJSON(resp)
-			}()
+				if err := w.writeMessage(resp); err != nil && w.onResponseWriteError != nil {
+					w.onResponseWriteError(w.ctx, err)
+				}
+			})
 
 		case hasListener:
-			// Aquire slot of sem to limit rate
-			select {
-			case w.sem <- struct{}{}:
-			case <-w.ctx.Done():
-				return
-			}
-			// Handle Request
-			go func() {
-				// Dispose aquired slot
-				defer func() { <-w.sem }()
-				// Call listener
+			w.dispatch(func() {
 				if err := listener(w.ctx, msg); err != nil && w.onListenerError != nil {
 					w.onListenerError(w.ctx, msg, err)
 				}
-			}()
+			})
 
 		default:
 			if w.onUnknownMsgType != nil {
-				// Aquire slot of sem to limit rate
-				select {
-				case w.sem <- struct{}{}:
-				case <-w.ctx.Done():
-					return
-				}
-				go func() {
-					defer func() { <-w.sem }()
+				w.dispatch(func() {
 					w.onUnknownMsgType(w.ctx, msg)
-				}()
+				})
 			}
 		}
 	}
@@ -234,7 +241,9 @@ func NewMessageRouter(ctx context.Context, iface IJsonReadWriter, opts ...func(*
 		cancel: cancel,
 		iface:  iface,
 
-		sem: make(chan struct{}, 8),
+		wg:              sync.WaitGroup{},
+		writeMux:        sync.Mutex{},
+		parallelization: DefaultParallelization,
 
 		pendingMux: sync.RWMutex{},
 		pending:    map[MessageId]chan Response[json.RawMessage]{},
@@ -245,12 +254,14 @@ func NewMessageRouter(ctx context.Context, iface IJsonReadWriter, opts ...func(*
 		listenerMux: sync.RWMutex{},
 		listener:    map[MessageType]func(ctx context.Context, msg Message[json.RawMessage]) error{},
 
-		onUnknownMsgType: nil,
-		onListenerError:  nil,
+		onUnknownMsgType:     nil,
+		onListenerError:      nil,
+		onResponseWriteError: nil,
 	}
 	for _, o := range opts {
 		o(m)
 	}
+	m.sem = make(chan struct{}, m.parallelization)
 	go m.readLoop()
 	return m
 }
@@ -261,7 +272,7 @@ func NewMessageRouter(ctx context.Context, iface IJsonReadWriter, opts ...func(*
 
 func WithMaxParallelization(p int) func(*MessageRouter) {
 	return func(da *MessageRouter) {
-		da.sem = make(chan struct{}, p)
+		da.parallelization = p
 	}
 }
 
@@ -274,6 +285,12 @@ func WithListenerErrorHandler(fn func(ctx context.Context, msg Message[json.RawM
 func WithUnknownMsgTypeHandler(fn func(ctx context.Context, msg Message[json.RawMessage])) func(*MessageRouter) {
 	return func(wm *MessageRouter) {
 		wm.onUnknownMsgType = fn
+	}
+}
+
+func WithResponseWriteErrorHandler(fn func(ctx context.Context, err error)) func(*MessageRouter) {
+	return func(wm *MessageRouter) {
+		wm.onResponseWriteError = fn
 	}
 }
 
