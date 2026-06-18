@@ -22,8 +22,8 @@ type IJsonReadWriter interface {
 	WriteJSON(v any) error
 }
 
-type Responder[I any, O any] func(ctx context.Context, req Request[I]) (O, error)
-type Listener[I any] func(ctx context.Context, req Message[I]) error
+type Responder[I any, O any] func(ctx context.Context, body I) (O, error)
+type Listener[I any] func(ctx context.Context, body I) error
 
 type MessageRouter struct {
 	ctx    context.Context
@@ -303,11 +303,7 @@ func WithResponder[I any, O any](msgType MessageType, handler Responder[I, O]) f
 			if err := json.Unmarshal(msg.Body, &body); err != nil {
 				return nil, fmt.Errorf("unmarshal request body: %w", err)
 			}
-			return handler(ctx, Request[I]{
-				MsgId: msg.MsgId,
-				Type:  msg.Type,
-				Body:  body,
-			})
+			return handler(ctx, body)
 		}
 	}
 }
@@ -321,11 +317,7 @@ func WithListener[I any](msgType MessageType, handler Listener[I]) func(*Message
 			if err := json.Unmarshal(msg.Body, &body); err != nil {
 				return fmt.Errorf("unmarshal message body: %w", err)
 			}
-			return handler(ctx, Message[I]{
-				MsgId: msg.MsgId,
-				Type:  msg.Type,
-				Body:  body,
-			})
+			return handler(ctx, body)
 		}
 	}
 }
