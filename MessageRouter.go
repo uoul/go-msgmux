@@ -3,6 +3,7 @@ package msgmux
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"sync"
 
@@ -53,10 +54,11 @@ type MessageRouter struct {
 // Public
 // --------------------------------------------------------------------------------------------------
 
-func SendRequest[I any, O any](ctx context.Context, w *MessageRouter, req Request[I]) (Response[O], error) {
-	// Create MsgId if not exists
-	if len(req.MsgId) <= 0 {
-		req.MsgId = MessageId(uuid.NewString())
+func SendRequest[I any, O any](ctx context.Context, w *MessageRouter, method string, body I) (O, error) {
+	// Create request
+	req := Request[I]{
+		MsgId: MessageId(uuid.NewString()),
+		Type:  MessageType(method),
 	}
 	// Create chanel for response
 	respCh := make(chan Response[json.RawMessage], 1)
@@ -64,7 +66,7 @@ func SendRequest[I any, O any](ctx context.Context, w *MessageRouter, req Reques
 	w.pendingMux.Lock()
 	if err := w.ctx.Err(); err != nil {
 		w.pendingMux.Unlock()
-		return Response[O]{}, fmt.Errorf("already closed: %w", err)
+		return *new(O), fmt.Errorf("already closed: %w", err)
 	}
 	// Register pending request
 	w.pending[MessageId(req.MsgId)] = respCh
@@ -77,39 +79,38 @@ func SendRequest[I any, O any](ctx context.Context, w *MessageRouter, req Reques
 	}()
 	// Send Request
 	if err := w.writeMessage(req); err != nil {
-		return Response[O]{}, fmt.Errorf("write request: %w", err)
+		return *new(O), fmt.Errorf("write request: %w", err)
 	}
 	// Wait for response or deadline exeeded
 	select {
 	case raw, ok := <-respCh:
 		if !ok {
 			// ReadLoop closed the channel — connection lost.
-			return Response[O]{}, fmt.Errorf("connection closed while waiting for response")
+			return *new(O), fmt.Errorf("connection closed while waiting for response")
+		}
+		if raw.Error != nil {
+			return *new(O), errors.New(*raw.Error)
 		}
 		// Parse body
 		var body O
 		if err := json.Unmarshal(raw.Body, &body); err != nil {
-			return Response[O]{}, fmt.Errorf("unmarshal response body: %w", err)
+			return *new(O), fmt.Errorf("unmarshal response body: %w", err)
 		}
-		return Response[O]{
-			MsgId: raw.MsgId,
-			Type:  raw.Type,
-			Error: raw.Error,
-			Body:  body,
-		}, nil
+		return body, nil
 
 	case <-ctx.Done():
-		return Response[O]{}, ctx.Err()
+		return *new(O), ctx.Err()
 
 	case <-w.ctx.Done():
-		return Response[O]{}, fmt.Errorf("already closed: %w", w.ctx.Err())
+		return *new(O), fmt.Errorf("already closed: %w", w.ctx.Err())
 	}
 }
 
-func SendMessage[I any](ctx context.Context, w *MessageRouter, msg Message[I]) error {
-	// Ensure message id
-	if len(msg.MsgId) <= 0 {
-		msg.MsgId = MessageId(uuid.NewString())
+func SendMessage[I any](ctx context.Context, w *MessageRouter, method string, body I) error {
+	// Create Message
+	msg := Message[I]{
+		MsgId: MessageId(uuid.NewString()),
+		Type:  MessageType(method),
 	}
 	return w.writeMessage(msg)
 }
@@ -294,11 +295,11 @@ func WithResponseWriteErrorHandler(fn func(ctx context.Context, err error)) func
 	}
 }
 
-func WithResponder[I any, O any](msgType MessageType, handler Responder[I, O]) func(*MessageRouter) {
+func WithResponder[I any, O any](method string, handler Responder[I, O]) func(*MessageRouter) {
 	return func(wm *MessageRouter) {
 		wm.responderMux.Lock()
 		defer wm.responderMux.Unlock()
-		wm.responder[msgType] = func(ctx context.Context, msg Message[json.RawMessage]) (any, error) {
+		wm.responder[MessageType(method)] = func(ctx context.Context, msg Message[json.RawMessage]) (any, error) {
 			var body I
 			if err := json.Unmarshal(msg.Body, &body); err != nil {
 				return nil, fmt.Errorf("unmarshal request body: %w", err)
@@ -308,11 +309,11 @@ func WithResponder[I any, O any](msgType MessageType, handler Responder[I, O]) f
 	}
 }
 
-func WithListener[I any](msgType MessageType, handler Listener[I]) func(*MessageRouter) {
+func WithListener[I any](method string, handler Listener[I]) func(*MessageRouter) {
 	return func(wm *MessageRouter) {
 		wm.listenerMux.Lock()
 		defer wm.listenerMux.Unlock()
-		wm.listener[msgType] = func(ctx context.Context, msg Message[json.RawMessage]) error {
+		wm.listener[MessageType(method)] = func(ctx context.Context, msg Message[json.RawMessage]) error {
 			var body I
 			if err := json.Unmarshal(msg.Body, &body); err != nil {
 				return fmt.Errorf("unmarshal message body: %w", err)

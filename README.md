@@ -67,11 +67,11 @@ router := msgmux.NewMessageRouter(ctx, myJsonReadWriter,
     msgmux.WithUnknownMsgTypeHandler(func(ctx context.Context, msg msgmux.Message[json.RawMessage]) {
         log.Printf("unknown message type: %s", msg.Type)
     }),
-    msgmux.WithResponder[RequestBody, ResponseBody]("my.request.type", func(ctx context.Context, req msgmux.Request[RequestBody]) (ResponseBody, error) {
+    msgmux.WithResponder[RequestBody, ResponseBody]("my.request.type", func(ctx context.Context, body RequestBody) (ResponseBody, error) {
         // handle request
         return ResponseBody{Result: "ok"}, nil
     }),
-    msgmux.WithListener[EventBody]("my.event.type", func(ctx context.Context, msg msgmux.Message[EventBody]) error {
+    msgmux.WithListener[EventBody]("my.event.type", func(ctx context.Context, body EventBody) error {
         // handle event
         return nil
     }),
@@ -82,23 +82,18 @@ defer router.Close()
 ### 4. Send a Request (and await a response)
 
 ```go
-resp, err := msgmux.SendRequest[RequestBody, ResponseBody](ctx, router, msgmux.Request[RequestBody]{
-    Type: "my.request.type",
-    Body: RequestBody{Foo: "bar"},
-})
+resp, err := msgmux.SendRequest[RequestBody, ResponseBody](ctx, router, "my.request.type", RequestBody{Foo: "bar"})
 if err != nil {
     log.Fatal(err)
 }
-fmt.Println(resp.Body)
+fmt.Println(resp)
 ```
 
 ### 5. Send a Fire-and-Forget Message
 
 ```go
-err := msgmux.SendMessage[EventBody](ctx, router, msgmux.Message[EventBody]{
-    Type: "my.event.type",
-    Body: EventBody{Value: 42},
-})
+err := msgmux.SendMessage[EventBody](ctx, router, "my.event.type", EventBody{Value: 42})
+
 ```
 
 ## Options
