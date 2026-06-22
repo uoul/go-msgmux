@@ -111,6 +111,7 @@ func SendMessage[I any](ctx context.Context, w *MessageRouter, method string, bo
 	msg := Message[I]{
 		MsgId: MessageId(uuid.NewString()),
 		Type:  MessageType(method),
+		Body:  body,
 	}
 	return w.writeMessage(msg)
 }
