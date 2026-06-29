@@ -59,6 +59,7 @@ func SendRequest[I any, O any](ctx context.Context, w *MessageRouter, method str
 	req := Request[I]{
 		MsgId: MessageId(uuid.NewString()),
 		Type:  MessageType(method),
+		Body:  body,
 	}
 	// Create chanel for response
 	respCh := make(chan Response[json.RawMessage], 1)
@@ -92,11 +93,11 @@ func SendRequest[I any, O any](ctx context.Context, w *MessageRouter, method str
 			return *new(O), errors.New(*raw.Error)
 		}
 		// Parse body
-		var body O
-		if err := json.Unmarshal(raw.Body, &body); err != nil {
+		var respBody O
+		if err := json.Unmarshal(raw.Body, &respBody); err != nil {
 			return *new(O), fmt.Errorf("unmarshal response body: %w", err)
 		}
-		return body, nil
+		return respBody, nil
 
 	case <-ctx.Done():
 		return *new(O), ctx.Err()
