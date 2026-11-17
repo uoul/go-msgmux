@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"sync"
+	"time"
 
 	"github.com/google/uuid"
 )
@@ -27,9 +28,10 @@ type Responder[I any, O any] func(ctx context.Context, body I) (O, error)
 type Listener[I any] func(ctx context.Context, body I) error
 
 type MessageRouter struct {
-	ctx    context.Context
-	cancel context.CancelFunc
-	iface  IJsonReadWriter
+	ctx            context.Context
+	cancel         context.CancelFunc
+	iface          IJsonReadWriter
+	handlerTimeout time.Duration
 
 	sem             chan struct{}
 	wg              sync.WaitGroup
@@ -140,7 +142,7 @@ func (w *MessageRouter) writeMessage(resp any) error {
 	return w.iface.WriteJSON(resp)
 }
 
-func (w *MessageRouter) dispatch(fn func()) {
+func (w *MessageRouter) dispatch(fn func(ctx context.Context)) {
 	// Limit number of spawned go routines
 	select {
 	case w.sem <- struct{}{}:
@@ -149,8 +151,12 @@ func (w *MessageRouter) dispatch(fn func()) {
 	}
 	// Execute handler non blocking
 	w.wg.Go(func() {
-		defer func() { <-w.sem }()
-		fn()
+		hCtx, hCancel := context.WithTimeout(w.ctx, w.handlerTimeout)
+		defer func() {
+			hCancel()
+			<-w.sem
+		}()
+		fn(hCtx)
 	})
 }
 
@@ -199,8 +205,8 @@ func (w *MessageRouter) readLoop() {
 			}
 		// Request from Device
 		case hasResponder:
-			w.dispatch(func() {
-				result, err := responder(w.ctx, msg)
+			w.dispatch(func(ctx context.Context) {
+				result, err := responder(ctx, msg)
 				resp := Response[any]{
 					MsgId: msg.MsgId,
 					Type:  msg.Type,
@@ -212,21 +218,21 @@ func (w *MessageRouter) readLoop() {
 					resp.Body = result
 				}
 				if err := w.writeMessage(resp); err != nil && w.onResponseWriteError != nil {
-					w.onResponseWriteError(w.ctx, err)
+					w.onResponseWriteError(ctx, err)
 				}
 			})
 
 		case hasListener:
-			w.dispatch(func() {
-				if err := listener(w.ctx, msg); err != nil && w.onListenerError != nil {
-					w.onListenerError(w.ctx, msg, err)
+			w.dispatch(func(ctx context.Context) {
+				if err := listener(ctx, msg); err != nil && w.onListenerError != nil {
+					w.onListenerError(ctx, msg, err)
 				}
 			})
 
 		default:
 			if w.onUnknownMsgType != nil {
-				w.dispatch(func() {
-					w.onUnknownMsgType(w.ctx, msg)
+				w.dispatch(func(ctx context.Context) {
+					w.onUnknownMsgType(ctx, msg)
 				})
 			}
 		}
@@ -240,9 +246,10 @@ func (w *MessageRouter) readLoop() {
 func NewMessageRouter(ctx context.Context, iface IJsonReadWriter, opts ...func(*MessageRouter)) *MessageRouter {
 	wsCtx, cancel := context.WithCancel(ctx)
 	m := &MessageRouter{
-		ctx:    wsCtx,
-		cancel: cancel,
-		iface:  iface,
+		ctx:            wsCtx,
+		cancel:         cancel,
+		iface:          iface,
+		handlerTimeout: 30 * time.Second,
 
 		wg:              sync.WaitGroup{},
 		writeMux:        sync.Mutex{},
@@ -272,6 +279,12 @@ func NewMessageRouter(ctx context.Context, iface IJsonReadWriter, opts ...func(*
 // --------------------------------------------------------------------------------------------------
 // Options
 // --------------------------------------------------------------------------------------------------
+
+func WithHandlerTimeout(d time.Duration) func(*MessageRouter) {
+	return func(mr *MessageRouter) {
+		mr.handlerTimeout = d
+	}
+}
 
 func WithMaxParallelization(p int) func(*MessageRouter) {
 	return func(da *MessageRouter) {
